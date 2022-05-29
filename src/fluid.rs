@@ -24,6 +24,10 @@ impl FluidVolume {
 		}
 	}
 
+	//
+	// Internal accessors that are of no use outside these classes:
+	//
+
 	fn get_property(&self, x:usize, y:usize, field: &Vec<f32>) -> f32 {
 		field[self.to_idx(x, y)]
 	}
@@ -47,6 +51,12 @@ impl FluidVolume {
 		lerp(top, bottom, y_frac)
 	}
 
+	//
+	// Public methods:
+	//
+
+	// Density:
+
 	/// Horizontally and vertically interpolate a measurement from the surrounding grid squares.
 	/// Assumes that x is somewhere between 0 and the number of cells wide.
 	/// Assumes y is also somewhere between 0 and the number of cells high.
@@ -63,6 +73,8 @@ impl FluidVolume {
 		let idx = self.to_idx(x, y);
 		self.density[idx] = value;
 	}
+
+	// Velocity:
 
 	pub fn set_velocity(&mut self, x:usize, y:usize, velocity:(f32, f32)) {
 		let idx = self.to_idx(x, y);
@@ -86,6 +98,11 @@ impl FluidVolume {
 	pub fn sample_velocity_y(&self, x: f32, y: f32) -> f32 {
 		self.sample_property(x, y, &self.y_velocity)
 	}
+
+	// Simulation steps:
+	// Normally we would do "accumulate forces, diffuse, update constraints" like verlet, but since
+	// we're trying to be nice about managing memory (i.e., relying on internal immutability and
+	// having the user provide output buffers) we are letting these be distinct steps.
 
 	/// Perform a step of the fluid density diffusion and write the output to the output set.
 	/// We have output as a separate mutable reference so we can double-buffer and switch between
@@ -124,8 +141,7 @@ impl FluidVolume {
 				for y in 1..self.grid_cell_count.1 - 1 {
 					for x in 1..self.grid_cell_count.0 - 1 {
 						output.set_density(x, y, (
-							self.get_density(x, y) + k*(output.get_density(x-1, y) + output.get_density(x+1, y) + output.get_density(x,y-1) + output.get_density(x, y+1))*0.25f32) /
-							(1.0f32 + k)
+							self.get_density(x, y) + k*(output.get_density(x-1, y) + output.get_density(x+1, y) + output.get_density(x,y-1) + output.get_density(x, y+1))*0.25f32) / (1.0f32 + k)
 						);
 					}
 				}
@@ -133,17 +149,32 @@ impl FluidVolume {
 		}
 	}
 
-	pub fn step_velocity(&self, delta_time:f32, output: &mut Self) {
+	/// Use the velocity of a given cell to 'flow' the density from the appropriate cells into the
+	/// centers of their new grid locations.  This does _not_ modify velocity.
+	/// The velocity is updated by the 'project' step.
+	pub fn step_density_with_velocity(&self, delta_time:f32, output:&mut Self) {
 		for y in 1..self.grid_cell_count.1 - 1 {
 			for x in 1..self.grid_cell_count.0 - 1 {
 				// dx/dy are used to select the point on the grid from which our velocity drives.
-				let dx = self.get_velocity_x(x, y);
-				let dy = self.get_velocity_y(x, y);
-				// Sample from the velocities at this point.
-				// We need to cap + wrap these, unlike the other cases.
-				output.set_velocity(x, y, (0.0, 0.0));
+				let dx = self.get_velocity_x(x, y)*delta_time;
+				let dy = self.get_velocity_y(x, y)*delta_time;
+				// The outer flow from this should match the inner flow, conservation of mass.
+				// So we can, for simplicity, just sample from this x/y - dx/dy.
+				let new_density = self.sample_density(x as f32 - dx, y as f32 - dy);
+				output.set_density(x, y, new_density);
 			}
 		}
+	}
+
+	/// Our fluid sim thus far does not conserve mass.
+	/// We use another iterative solver to break the system into a curl and a divergence component.
+	/// Helmholtz Decomposition: Any vector field can be expressed as the sum of a field that is
+	/// free of curl and one that is free of divergence.
+	/// Can't compute divergence-free directly, so we compute the curl free part and subtract that
+	/// from the original.
+	/// When the steps are complete, we discard the divergence component to maintain mass.
+	pub fn step_clear_divergence(&self, iterations:usize, output:&mut Self) {
+
 	}
 }
 

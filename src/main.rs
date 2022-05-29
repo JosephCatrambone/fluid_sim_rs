@@ -47,7 +47,7 @@ fn main() {
 
 		for _ in 0..SUBSTEPS {
 			fluid_tick.step_density_diffusion(DIFFUSION_RATE, SIMULATION_ITERATIONS, &mut fluid_tock);
-			fluid_tock.step_density_diffusion(DIFFUSION_RATE, SIMULATION_ITERATIONS, &mut fluid_tick);
+			fluid_tock.step_density_with_velocity(1.0f32, &mut fluid_tick);
 		}
 
 		// We unwrap here as we want this code to exit if it fails. Real applications may want to handle this in a different way
