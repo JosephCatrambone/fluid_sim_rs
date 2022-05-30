@@ -11,22 +11,25 @@ pub struct FluidVolume {
 	next_density: Vec<f32>,
 	divergence: Vec<f32>, // Although this isn't used directly, we pre-allocate a divergence field so we don't have to re-allocate memory every single step.
 	projection: Vec<f32>, // This is the divergence free field.  Again, pre-allocated to prevent memory fragmentation.
+	next_projection: Vec<f32>, // This is the divergence free field.  Again, pre-allocated to prevent memory fragmentation.
 }
 
 impl FluidVolume {
-	#[inline]
 	fn to_idx(&self, x:usize, y:usize) -> usize {
-		x.rem_euclid(self.grid_cell_count.0) + (y.rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0
+		// Wrap:
+		//x.rem_euclid(self.grid_cell_count.0) + (y.rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0
+		// Cap:
+		x.max(0).min(self.grid_cell_count.0) + y.max(0).min(self.grid_cell_count.1)*self.grid_cell_count.0
 	}
 
 	/// Get center, left, right, top, bottom indices from the given X and Y coordinates.
 	/// Respects wrapping rules and boundary conditions.
 	fn get_clrtb_idx(&self, x:usize, y:usize) -> (usize, usize, usize, usize, usize) {
-		let center_idx = x.rem_euclid(self.grid_cell_count.0) + (y.rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0;
-		let left_idx = (x-1).rem_euclid(self.grid_cell_count.0) + (y.rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0;
-		let right_idx = (x+1).rem_euclid(self.grid_cell_count.0) + (y.rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0;
-		let top_idx = x.rem_euclid(self.grid_cell_count.0) + ((y-1).rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0;
-		let bottom_idx = x.rem_euclid(self.grid_cell_count.0) + ((y+1).rem_euclid(self.grid_cell_count.1))*self.grid_cell_count.0;
+		let center_idx = self.to_idx(x, y);
+		let left_idx = self.to_idx(x-1, y);
+		let right_idx = self.to_idx(x+1, y);
+		let top_idx = self.to_idx(x, y-1);
+		let bottom_idx = self.to_idx(x, y+1);
 		(center_idx, left_idx, right_idx, top_idx, bottom_idx)
 	}
 
@@ -41,6 +44,7 @@ impl FluidVolume {
 			next_density: (0..(width*height)).map(|_| { 0f32 }).collect(),
 			divergence: (0..(width*height)).map(|_| { 0f32 }).collect(),
 			projection: (0..(width*height)).map(|_| { 0f32 }).collect(),
+			next_projection: (0..(width*height)).map(|_| { 0f32 }).collect(),
 		}
 	}
 
@@ -150,9 +154,10 @@ impl FluidVolume {
 	// Simulation steps: "accumulate forces, diffuse, update constraints" like verlet.
 
 	pub fn step(&mut self, diffusion_rate:f32, delta_time:f32, iterations:usize) {
-		self.step_density_diffusion(diffusion_rate, iterations);
-		self.step_density_with_velocity(delta_time);
-		self.step_clear_divergence(iterations);
+		self.diffuse(diffusion_rate, iterations);
+		self.project(diffusion_rate, iterations);
+		self.advect(delta_time);
+		self.project(diffusion_rate, iterations);
 	}
 
 	/// Perform a step of the fluid density diffusion and write the output to the output set.
@@ -160,7 +165,7 @@ impl FluidVolume {
 	/// two pre-allocated fluids.
 	/// If iterations is zero, this will use the fast solver.
 	/// If iterations is more than zero, this will use Gauss-Seidel.
-	fn step_density_diffusion(&mut self, diffusion_rate:f32, iterations:usize) {
+	fn diffuse(&mut self, diffusion_rate:f32, iterations:usize) {
 		// d(x,y) = density at x,y
 		// s(x,y) = mean of all adjacent squares to x,y = (d(x+1,y) + d(x-1,y) + d(x,y+1) + d(x,y-1))/4.
 		// k = rate of change
@@ -194,9 +199,10 @@ impl FluidVolume {
 				for y in 1..self.grid_cell_count.1 - 1 {
 					for x in 1..self.grid_cell_count.0 - 1 {
 						let (idx, left, right, up, down) = self.get_clrtb_idx(x, y);
-						self.next_density[idx] = (self.density[idx] + diffusion_rate * ((self.next_density[left] + self.next_density[right] + self.next_density[up] + self.next_density[down])*0.25f32)) / (1.0f32 + diffusion_rate);
+						self.next_density[idx] = (self.density[idx] + diffusion_rate * ((self.density[left] + self.density[right] + self.density[up] + self.density[down])*0.25f32)) / (1.0f32 + diffusion_rate);
 					}
 				}
+				self.density[..].copy_from_slice(&self.next_density.as_slice());
 			}
 		}
 
@@ -207,7 +213,7 @@ impl FluidVolume {
 	/// Use the velocity of a given cell to 'flow' the density from the appropriate cells into the
 	/// centers of their new grid locations.  This does _not_ modify velocity.
 	/// The velocity is updated by the 'project' step.
-	fn step_density_with_velocity(&mut self, delta_time:f32) {
+	fn advect(&mut self, delta_time:f32) {
 		// Note that this updates both next and current density.
 		for y in 1..self.grid_cell_count.1 - 1 {
 			for x in 1..self.grid_cell_count.0 - 1 {
@@ -231,7 +237,7 @@ impl FluidVolume {
 	/// Helmholtz Decomposition: Any vector field can be expressed as the sum of a field that is free of curl and one that is free of divergence.
 	/// Can't compute divergence-free directly, so we compute the curl free part and subtract that from the original.
 	/// When the steps are complete, we discard the divergence component to maintain mass.
-	fn step_clear_divergence(&mut self, iterations:usize) {
+	fn project(&mut self, diffusion_rate:f32, iterations:usize) {
 		// First, we compute the divergence of _this_ field based on the velocity,
 		// then we perform helmholtz decomposition using the same Gauss-Seidel trick above,
 		// then we subtract off the divergence.
@@ -249,6 +255,7 @@ impl FluidVolume {
 				let v_flow = self.y_velocity[down] - self.y_velocity[up];
 				self.divergence[idx] = -0.5*(h_flow+v_flow)*divergence_norm_factor;
 				self.projection[idx] = 0.0f32;
+				//self.next_projection[idx] = 0.0f32; // Not required because we're setting this in the next step.
 			}
 		}
 
@@ -257,19 +264,19 @@ impl FluidVolume {
 			for y in 1..self.grid_cell_count.1 - 1 {
 				for x in 1..self.grid_cell_count.0 - 1 {
 					let (idx, left, right, up, down) = self.get_clrtb_idx(x, y);
-					// Original paper by Stam has this as the mean of the projection AND divergence, but I think that's wrong, so I'm using the sum of divergence and the mean of projection..
-					//self.projection[idx] = self.divergence[idx] + (self.projection[left] + self.projection[right] + self.projection[up] + self.projection[down]) * 0.25f32;
-					self.projection[idx] = (self.divergence[idx] + self.projection[left] + self.projection[right] + self.projection[up] + self.projection[down]) * 0.25f32;
+					// Original paper by Stam has this as the mean of the projection AND divergence, but I think that's wrong, so I'm using the sum of divergence and the mean of projections.
+					self.next_projection[idx] = (self.divergence[idx] + diffusion_rate * ((self.projection[left] + self.projection[right] + self.projection[up] + self.projection[down]) * 0.25f32)) / (1.0f32 + diffusion_rate);
 				}
 			}
+			self.projection[..].copy_from_slice(&self.next_projection.as_slice());
 		}
 
 		// Finally update our velocity based on the iterated projection.
 		for y in 1..self.grid_cell_count.1 - 1 {
 			for x in 1..self.grid_cell_count.0 - 1 {
 				let (idx, left, right, up, down) = self.get_clrtb_idx(x, y);
-				self.x_velocity[idx] = 0.5*(self.projection[right]-self.projection[left])*x_velocity_scale_factor;
-				self.y_velocity[idx] = 0.5*(self.projection[down]-self.projection[up])*y_velocity_scale_factor;
+				self.x_velocity[idx] -= 0.5*(self.projection[right]-self.projection[left])*x_velocity_scale_factor;
+				self.y_velocity[idx] -= 0.5*(self.projection[down]-self.projection[up])*y_velocity_scale_factor;
 			}
 		}
 	}
